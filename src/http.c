@@ -16,6 +16,9 @@ options_t opt = {0};
 void print_usage(void) {
     print("usage: http [flags] [method] <url> [key=value] [body]\n");
     print("options:");
+    print("\t-b  --body-only  only print the body\n");
+    print("\t-c  --clean      don't do any pretty printing\n");
+    print("\t-p  --pipe       same as -b -c, useful for piping\n");
 }
 
 http_header_t *parse_header(arena_t *arena, strview_t arg) {
@@ -117,6 +120,10 @@ int main(int argc, char **argv) {
         .body = strv(opt.body),
     });
 
+    if (response.status_code == 0) {
+        return 1;
+    }
+
     if (!opt.body_only) {
         if (opt.clean) {
             print("HTTP/%d.%d, %d %s\n", 
@@ -152,6 +159,11 @@ int main(int argc, char **argv) {
     bool is_json = strv_contains_view(content_type, strv("json"));
 
     if (!opt.clean && is_json) {
+        if (!strv_starts_with(response.body, '{')) {
+            str_t full = str_fmt(&arena, "{ \"data\": %v }", response.body);
+            response.body = strv(full);
+        }
+
         json_t *json = json_parse_str(&arena, response.body, JSON_DEFAULT);
 
         json_pretty_print(json, &(json_pretty_opts_t){0}); 

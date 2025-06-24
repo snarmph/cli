@@ -17,60 +17,131 @@
 #define ICON_TEXT        "t" 
 
 #else
-
-#define ICON_FOLDER      ""
-#define ICON_FILE        ""
-#define ICON_CODE        "" 
-#define ICON_BIN         ""
-#define ICON_ZIP         ""
-#define ICON_IMG         ""
-#define ICON_MOV         "󰸬"
-#define ICON_MUSIC       "󰸪"
-#define ICON_CONF        "󱁼"
-#define ICON_TEXT        ""
-
+//
+// #define ICON_FOLDER      ""
+// #define ICON_FILE        ""
+// #define ICON_CODE        "" 
+// #define ICON_BIN         ""
+// #define ICON_ZIP         ""
+// #define ICON_IMG         ""
+// #define ICON_MOV         "󰸬"
+// #define ICON_MUSIC       "󰸪"
+// #define ICON_CONF        "󱁼"
+// #define ICON_TEXT        ""
+//
 #endif
 
 #define ICONMAP_SIZE 128 
 
+typedef enum {
+    ICON_NONE,
+
+    ICON_FOLDER,
+    ICON_FILE,
+    ICON_CODE,
+    ICON_BIN,
+    ICON_ZIP,
+    ICON_IMG,
+    ICON_MOV,
+    ICON_MUSIC,
+    ICON_CONF,
+    ICON_TEXT,
+
+    ICON__COUNT,
+} icons_e;
+
+typedef enum {
+    ICON_STYLE_NONE,
+    ICON_STYLE_NERD,
+    ICON_STYLE_EMOJI,
+
+    ICON_STYLE__COUNT,
+} icon_style_e;
+
+strview_t icons[ICON_STYLE__COUNT][ICON__COUNT] = {
+    [ICON_STYLE_NONE] = {
+
+        [ICON_FOLDER] = cstrv(">"),
+        [ICON_FILE]   = cstrv("-"),
+        [ICON_CODE]   = cstrv("-"),
+        [ICON_BIN]    = cstrv("@"),
+        [ICON_ZIP]    = cstrv("z"),
+        [ICON_IMG]    = cstrv("*"),
+        [ICON_MOV]    = cstrv("v"),
+        [ICON_MUSIC]  = cstrv("m"),
+        [ICON_CONF]   = cstrv("c"),
+        [ICON_TEXT]   = cstrv("t"),
+
+    },
+    [ICON_STYLE_NERD] = {
+ 
+        [ICON_FOLDER] = cstrv(""),
+        [ICON_FILE]   = cstrv(""),
+        [ICON_CODE]   = cstrv(""),
+        [ICON_BIN]    = cstrv(""),
+        [ICON_ZIP]    = cstrv(""),
+        [ICON_IMG]    = cstrv(""),
+        [ICON_MOV]    = cstrv("󰸬"),
+        [ICON_MUSIC]  = cstrv("󰸪"),
+        [ICON_CONF]   = cstrv("󱁼"),
+        [ICON_TEXT]   = cstrv(""),
+
+    },
+    [ICON_STYLE_EMOJI] = {
+ 
+        [ICON_FOLDER] = cstrv("📂"),
+        [ICON_FILE]   = cstrv("📄"),
+        [ICON_CODE]   = cstrv("💻"),
+        [ICON_BIN]    = cstrv("🤖"),
+        [ICON_ZIP]    = cstrv("📦"),
+        [ICON_IMG]    = cstrv("📸"),
+        [ICON_MOV]    = cstrv("🎥"),
+        [ICON_MUSIC]  = cstrv("🎧"),
+        [ICON_CONF]   = cstrv("🔧"),
+        [ICON_TEXT]   = cstrv("📑"),
+
+    },
+};
+
 typedef struct icons_map_t icons_map_t;
 struct icons_map_t {
+    icon_style_e style;
     strview_t keys[ICONMAP_SIZE];
-    const char *values[ICONMAP_SIZE];
+    strview_t values[ICONMAP_SIZE];
     u64 hashes[ICONMAP_SIZE];
 };
 
-icons_map_t map = {0};
+icons_map_t icon__map = {0};
 
-void icons_init(void);
-void iconsmap__add(strview_t key, const char *ico);
-const char *iconsmap__get(strview_t key);
+void icons_init(icon_style_e style);
+void iconsmap__add(strview_t key, strview_t ico);
+strview_t iconsmap__get(strview_t key);
 u64 iconsmap__hash(strview_t key);
 
-const char *ext_to_ico(strview_t ext) {
+strview_t ext_to_ico(strview_t ext) {
     return iconsmap__get(ext); 
 }
 
 // ICONS HASHMAP IMPLEMENTATION //////////////////////////////
 
-void iconsmap__add(strview_t key, const char *ico) {
+void iconsmap__add(strview_t key, strview_t ico) {
     u64 hash = iconsmap__hash(key);
     usize index = hash & (ICONMAP_SIZE - 1);
 
     for (usize i = index; i < ICONMAP_SIZE; ++i) {
-        if (map.hashes[i] == 0) {
-            map.hashes[i] = hash;
-            map.keys[i] = key;
-            map.values[i] = ico;
+        if (icon__map.hashes[i] == 0) {
+            icon__map.hashes[i] = hash;
+            icon__map.keys[i] = key;
+            icon__map.values[i] = ico;
             return;
         }
     }
 
     for (usize i = 0; i < index; ++i) {
-        if (map.hashes[i] == 0) {
-            map.hashes[i] = hash;
-            map.keys[i] = key;
-            map.values[i] = ico;
+        if (icon__map.hashes[i] == 0) {
+            icon__map.hashes[i] = hash;
+            icon__map.keys[i] = key;
+            icon__map.values[i] = ico;
             return;
         }
     }
@@ -78,39 +149,39 @@ void iconsmap__add(strview_t key, const char *ico) {
     fatal("could not find an empty slot in icons hashmap, increase ICONMAP_SIZE");
 }
 
-const char *iconsmap__get(strview_t key) {
+strview_t iconsmap__get(strview_t key) {
     if (strv_is_empty(key)) {
-        return ICON_FILE;
+        return icons[icon__map.style][ICON_FILE];
     }
 
     u64 hash = iconsmap__hash(key);
     usize index = hash & (ICONMAP_SIZE - 1);
     for (usize i = index; i < ICONMAP_SIZE; ++i) {
-        if (map.hashes[i] == hash && 
-            strv_equals(map.keys[i], key))
+        if (icon__map.hashes[i] == hash && 
+            strv_equals(icon__map.keys[i], key))
         {
-            return map.values[i];
+            return icon__map.values[i];
         }
 
-        if (map.hashes[i] == 0) {
-            return ICON_FILE;
+        if (icon__map.hashes[i] == 0) {
+            return icons[icon__map.style][ICON_FILE];
         }
     }
 
     for (usize i = 0; i < index; ++i) {
-        if (map.hashes[i] == hash && 
-            strv_equals(map.keys[i], key))
+        if (icon__map.hashes[i] == hash && 
+            strv_equals(icon__map.keys[i], key))
         {
-            return map.values[i];
+            return icon__map.values[i];
         }
 
-        if (map.hashes[i] == 0) {
-            return ICON_FILE;
+        if (icon__map.hashes[i] == 0) {
+            return icons[icon__map.style][ICON_FILE];
         }
     }
 
     // return a default icon for unrecognized files
-    return ICON_FILE;
+    return icons[icon__map.style][ICON_FILE];
 }
 
 u64 iconsmap__hash(strview_t key) {
@@ -124,9 +195,11 @@ u64 iconsmap__hash(strview_t key) {
     return hash;
 }
 
-void icons_init(void) {
+void icons_init(icon_style_e style) {
+    icon__map.style = style;
+
     // add all the known icons here!
-#define add_ico(ext, ico) iconsmap__add((strview_t)cstrv(ext), ICON_##ico)
+#define add_ico(ext, ico) iconsmap__add((strview_t)cstrv(ext), icons[style][ICON_##ico])
 
     // CODE ICONS
 

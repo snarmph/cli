@@ -1,4 +1,13 @@
 #include "colla/build.c"
+#include "common.h"
+
+#include "term.c"
+
+#define ATOMIC_SET(v, x) (InterlockedExchange(&v, (x)))
+#define ATOMIC_CHECK(v)  (InterlockedCompareExchange(&v, 1, 1))
+#define ATOMIC_INC(v) (InterlockedIncrement(&v))
+#define ATOMIC_DEC(v) (InterlockedDecrement(&v))
+#define ATOMIC_GET(v) (InterlockedOr(&v, 0))
 
 typedef struct options_t options_t;
 struct options_t {
@@ -11,20 +20,30 @@ struct options_t {
 
 options_t opt = {0};
 
-str_t get_local_folder(arena_t *arena) {
-    u8 tmpbuf[KB(5)];
-    arena_t scratch = arena_make(ARENA_STATIC, sizeof(tmpbuf), tmpbuf);
+struct {
+    arena_t scratch;
+    arena_t arena;
+    outstream_t data;
+    str_t prev_chunk;
+    oshandle_t mtx;
+} ask = {0};
 
-    TCHAR tpath[512] = {0};
+struct {
+    arena_t md_arena;
+    arena_t *arena;
+    // bool finished;
+    spinner_t spinner;
+    outstream_t markdown;
+    strview_t prev_parsed;
+    str_t parsed;
+    oshandle_t mtx;
+    volatile long finished;
+    bool finished_printing;
+} app = {0};
 
-    DWORD len = GetModuleFileName(NULL, tpath, arrlen(tpath));
-
-    str_t path = str_from_tstr(&scratch, tstr_init(tpath, len));
-    
-    strview_t dir;
-    os_file_split_path(strv(path), &dir, NULL, NULL);
-
-    return str(arena, dir);
+void print_usage(void) {
+    println("usage:");
+    println("ask <question>");
 }
 
 strview_t get_input(arena_t *arena) {
@@ -62,38 +81,32 @@ void setup_conf(arena_t scratch, strview_t filename) {
     os_file_print(scratch, fp, "prompt = %v\n\n", prompt);
 
     os_file_close(fp);
-
-    // while (true) {
-    //     os_wait_t res = os_wait_on_handles(&input, 1, true, OS_WAIT_INFINITE);
-    //     info("res: %d", res.result);
-    //     str_t data = os_file_read_all_str_fp(&scratch, input);
-    //     info("(%v)", data);
-    //     break;
-    // }
 }
 
 void load_options(arena_t *arena, int argc, char **argv) {
-    str_t local_dir = get_local_folder(arena);
+    if (argc == 1) {
+        print_usage();
+        os_abort(1);
+    }
 
-    str_t conf_fname = str_fmt(arena, "%v/conf.ini", local_dir);
+    str_t conf_fname = STR_EMPTY;
+    ini_t conf = common_get_config(arena, &conf_fname);
 
-    if (!os_file_exists(strv(conf_fname))) {
+    if (!ini_is_valid(&conf)) {
         warn("no configuration file was found, let's set it up");
         setup_conf(*arena, strv(conf_fname));
         info("saved configuration to %v", conf_fname);
     }
 
-    ini_t conf = ini_parse(arena, strv(conf_fname), NULL);
-
-    initable_t *ask = ini_get_table(&conf, strv("ask"));
-    if (!ask) {
+    initable_t *ini_ask = ini_get_table(&conf, strv("ask"));
+    if (!ini_ask) {
         warn("a configuration file was found at %v, but there is no [ask] category", conf_fname);
         os_abort(1);
     }
     
-    inivalue_t *model  = ini_get(ask, strv("model"));
-    inivalue_t *key    = ini_get(ask, strv("key"));
-    inivalue_t *prompt = ini_get(ask, strv("prompt"));
+    inivalue_t *model  = ini_get(ini_ask, strv("model"));
+    inivalue_t *key    = ini_get(ini_ask, strv("key"));
+    inivalue_t *prompt = ini_get(ini_ask, strv("prompt"));
 
     if (!model) {
         warn("invalid configuration found in %v, model is missing", conf_fname);
@@ -128,6 +141,7 @@ typedef enum {
     MD_STATE_CODEHEADER,
     MD_STATE_CODE,
     MD_STATE_CODEINLINE,
+    MD_STATE_HOR_LINE,
     MD_STATE_LINK,
     MD_STATE__COUNT,
 } md_state_e;
@@ -145,6 +159,7 @@ md_colour_t colours[MD_STATE__COUNT] = {
     [MD_STATE_CODEHEADER] = { LOG_COL_YELLOW, LOG_COL_RESET },
     [MD_STATE_CODE]       = { LOG_COL_RESET, LOG_COL_RESET },
     [MD_STATE_CODEINLINE] = { LOG_COL_BLUE, LOG_COL_RESET },
+    [MD_STATE_HOR_LINE]   = { LOG_COL_DARK_GREY, LOG_COL_RESET },
     [MD_STATE_LINK]       = { LOG_COL_GREEN, LOG_COL_RESET },
 };
 
@@ -152,65 +167,98 @@ md_colour_t colours[MD_STATE__COUNT] = {
 
 typedef struct md_t md_t;
 struct md_t {
-    arena_t scratch;
-    str_t prev_chunk;
-    bool was_code_newline;
     md_state_e last_printed;
     md_state_e states[MAX_STATE_STACK];
     int count;
-    oshandle_t debug_fp;
+
+    bool was_code_newline;
+    bool was_code;
+    int code_stack;
+    bool was_newline;
 };
 
-#define head() ctx->states[ctx->count - 1]
+#define head() md.states[md.count - 1]
 #define push(new_state) do { \
-        md_state_e __head = ctx->states[ctx->count - 1]; \
+        md_state_e __head = md.states[md.count - 1]; \
         if (__head != (new_state) && __head != MD_STATE_CODE) { \
-            ctx->states[ctx->count++] = (new_state); \
+            md.states[md.count++] = (new_state); \
         } \
     } while (0)
-#define pop() if(ctx->count > 1) ctx->count--
+#define pop() if(md.count > 1) md.count--
 
-#define print_str(ctx, v) do { md_try_update_colour(ctx); os_file_puts(os_stdout(), v); } while(0)
-#define print_char(ctx, c) do { md_try_update_colour(ctx); os_file_putc(os_stdout(), c); } while(0)
+#define print_str(v) do { md_try_update_colour(&md, &out); ostr_puts(&out, v); } while(0)
+#define print_char(c) do { md_try_update_colour(&md, &out); ostr_putc(&out, c); } while(0)
 
-void md_try_update_colour(md_t *ctx) {
+void md_try_update_colour(md_t *ctx, outstream_t *out) {
     if (
         (ctx->count && ctx->last_printed != ctx->states[ctx->count - 1]) ||
         (!ctx->count && ctx->last_printed != MD_STATE_NONE)
     ) {
         md_colour_t col = colours[ctx->states[ctx->count - 1]];
-        os_log_set_colour_bg(col.foreground, col.background);
+        ostr_print(out, "</><%v>", pretty_log_to_colour(col.foreground));
         ctx->last_printed = ctx->states[ctx->count - 1];
     }
 }
 
-void md_print_chunk(strview_t content, md_t *ctx) {
-    os_file_puts(ctx->debug_fp, content);
+str_t md_parse_chunk(arena_t *arena, strview_t chunk) {
+    outstream_t out = ostr_init(arena);
 
-    instream_t in = istr_init(content);
-    bool was_newline = true;
+    md_t md = {0};
+
+    instream_t in = istr_init(chunk);
     bool is_newline = false;
-    //
-    // if (ctx->was_code_newline && istr_peek(&in) != '`') {
-    //     print_str(ctx, strv("│ "));
-    // }
-    //
-    // ctx->was_code_newline = false;
 
     while (!istr_is_finished(&in)) {
         char peek = istr_peek(&in);
-        bool is_in_code = head() == MD_STATE_CODE || head() == MD_STATE_CODEINLINE;
+        bool is_in_code = md.code_stack > 0;
 
-        if (ctx->was_code_newline && peek != '`') {
-            print_str(ctx, strv("| "));
+        if (md.was_code_newline && peek != '`') {
+            print_str(strv("│ "));
         }
-        ctx->was_code_newline = false;
+        md.was_code_newline = false;
+
+        if (md.was_code) {
+            md.was_code = false;
+            if (peek == '\\' && istr_peek_next(&in) == 'n') {
+                if (md.code_stack > 2) {
+                    print_str(strv("│"));
+                    for (int i = 0; i < md.code_stack; ++i) {
+                        print_char(' ');
+                    }
+                    print_str(strv("```"));
+                }
+                else {
+                    print_str(strv("╰───"));
+                    pop();
+                }
+                md.code_stack--;
+            } 
+            else {
+                if (md.code_stack > 1) {
+                    print_str(strv("│"));
+                    for (int i = 0; i < md.code_stack; ++i) {
+                        print_char(' ');
+                    }
+                    print_str(strv("```"));
+                }
+                else {
+                    print_str(strv("╭─── "));
+                    push(MD_STATE_CODEHEADER);
+                }
+                md.code_stack++;
+            }
+            goto skip_print;
+        }
 
         switch (peek) {
             case '#':
-                if (!is_in_code && was_newline) {
+                if (!is_in_code && md.was_newline) {
                     push(MD_STATE_HEADING);
-                    print_char(ctx, '>');
+                    
+                    while (istr_peek(&in) == '#') istr_skip(&in, 1);
+                    
+                    print_char('>');
+                    print_char(' ');
                     istr_skip(&in, 1);
                     goto skip_print;
                 }
@@ -219,7 +267,7 @@ void md_print_chunk(strview_t content, md_t *ctx) {
             case '-':    
                 if (is_in_code) break;
 
-                if (was_newline && istr_peek_next(&in) != '-') {
+                if (md.was_newline && istr_peek_next(&in) != '-') {
                     push(MD_STATE_LIST);
                 }
                 break;
@@ -227,8 +275,8 @@ void md_print_chunk(strview_t content, md_t *ctx) {
             case '>':
                 if (is_in_code) break;
 
-                if (was_newline) {
-                    print_str(ctx, strv("░"));
+                if (md.was_newline) {
+                    print_str(strv("░"));
                     istr_skip(&in, 1);
                     goto skip_print;
                 }
@@ -243,39 +291,63 @@ void md_print_chunk(strview_t content, md_t *ctx) {
                 }
 
                 if (count == 3) {
-                    if (head() == MD_STATE_CODE) {
-                        print_str(ctx, strv("╰───"));
-                        // print_str(ctx, strv("░▒▓"));
-                        pop();
+                    bool is_closing = istr_peek(&in) == '\\' && istr_peek_next(&in) == 'n';
+                    if (istr_peek_next(&in) == '\0') {
+                        md.was_code = true;
+                        goto skip_print;
+                    }
+
+                    if (is_closing) {
+                        if (md.code_stack > 1) {
+                            print_str(strv("│"));
+                            for (int i = 0; i < md.code_stack; ++i) {
+                                print_char(' ');
+                            }
+                            print_str(strv("```"));
+                        }
+                        else {
+                            print_str(strv("╰───"));
+                            pop();
+                        }
+                        md.code_stack--;
                     }
                     else {
-                        // print_str(ctx, strv("▓▒░ "));
-                        print_str(ctx, strv("╭─── "));
-                        push(MD_STATE_CODEHEADER);
+                        if (md.code_stack > 0) {
+                            print_str(strv("│"));
+                            for (int i = 0; i < md.code_stack; ++i) {
+                                print_char(' ');
+                            }
+                            print_str(strv("```"));
+                        }
+                        else {
+                            print_str(strv("╭─── "));
+                            push(MD_STATE_CODEHEADER);
+                        }
+                        md.code_stack++;
                     }
+
                     goto skip_print;
                 }
-                if (count == 1) {
+
+                if  (count == 1) {
                     if (head() == MD_STATE_CODEINLINE) {
-                        print_char(ctx, '`');
+                        print_char('`');
                         pop();
+                        md.code_stack--;
                     }
                     else {
+                        md.code_stack++;
                         push(MD_STATE_CODEINLINE);
-                        print_char(ctx, '`');
+                        print_char('`');
                     }
                     goto skip_print;
                 }
+
                 break;
             }
 
             case '\\':
                 switch (istr_peek_next(&in)) {
-                    case '`':
-                        istr_skip(&in, 2);
-                        print_char(ctx, '`');
-                        goto skip_print;
-
                     case 'n':
                         is_newline = true;
 
@@ -284,35 +356,24 @@ void md_print_chunk(strview_t content, md_t *ctx) {
                             pop();
                             push(MD_STATE_CODE);
                         }
-                        else if (was_newline && head() != MD_STATE_CODE) {
+                        else if (md.was_newline && head() != MD_STATE_CODE) {
                             pop();
                         }
-                        else if (head() == MD_STATE_LIST) {
+                        else if (head() == MD_STATE_LIST || head() == MD_STATE_HEADING) {
                             pop();
                         }                       
 
-                        print_char(ctx, '\n');
+                        print_char('\n');
 
                         if (head() == MD_STATE_CODE) {
-                            ctx->was_code_newline = true;
+                            md.was_code_newline = true;
                         }
 
-                        // char next = istr_peek(&in);
-                        //
-                        // if (head() == MD_STATE_CODE && next != '`') {
-                        //     if (next) {
-                        //         print_str(ctx, strv("│ "));
-                        //     }
-                        //     else {
-                        //         ctx->was_code_newline = true;
-                        //     }
-                        // }
-                        //
                         goto skip_print;
 
                     default:
                         istr_skip(&in, 1);
-                        print_char(ctx, istr_get(&in));
+                        print_char(istr_get(&in));
                         goto skip_print;
                 }
                 break;
@@ -321,7 +382,6 @@ void md_print_chunk(strview_t content, md_t *ctx) {
             {
                 if (is_in_code) break;
 
-                char prev = istr_prev(&in);
                 int count = 0;
                 while (istr_peek(&in) == '*') {
                     istr_skip(&in, 1);
@@ -330,10 +390,10 @@ void md_print_chunk(strview_t content, md_t *ctx) {
 
                 char bold_str[] = "**********";
 
-                if (count == 1 && was_newline) {
+                if (count == 1 && md.was_newline) {
                     push(MD_STATE_LIST);
-                    assert(count < arrlen(bold_str)-1);
-                    print_str(ctx, strv(bold_str, count));
+                    colla_assert(count < arrlen(bold_str)-1);
+                    print_str(strv(bold_str, count));
                 }
                 else if (head() == MD_STATE_BOLD) {
                     pop();
@@ -348,7 +408,7 @@ void md_print_chunk(strview_t content, md_t *ctx) {
             {
                 if (is_in_code) break;
 
-                if (!char_is_num(peek) || !was_newline) {
+                if (!char_is_num(peek) || !md.was_newline) {
                     break;
                 }
 
@@ -366,66 +426,84 @@ void md_print_chunk(strview_t content, md_t *ctx) {
                 }
                 else {
                     push(MD_STATE_LIST);
-                    print_str(ctx, num);
+                    print_str(num);
                     goto skip_print;
                 }
             }
         }
 
-        if (was_newline && char_is_space(peek)) {
+        if (md.was_newline && char_is_space(peek)) {
             is_newline = true;
         }
 
-        print_char(ctx, istr_get(&in));
+        print_char(istr_get(&in));
 
 skip_print:
-        was_newline = is_newline;
+        md.was_newline = is_newline;
         is_newline = false;
     }
+
+    ostr_puts(&out, strv("</>"));
+
+    return ostr_to_str(&out);
 }
 
-void md_eval_chunk(strview_t chunk, void *userdata) {
-    md_t *ctx = userdata;
-    
-    if (!strv_contains(chunk, '\n')) {
-        if (!str_is_empty(ctx->prev_chunk)) {
-            err("chunk should be empty");
-        }
-        ctx->prev_chunk = str(&ctx->scratch, chunk);
-        return;
-    }
-    
-    usize begin = strv_find_view(chunk, strv("data: "), 0);
-    if (begin == STR_NONE) {
-        return;
-    }
+void ask_grab_chunk(strview_t chunk, void *userdata) {
+    COLLA_UNUSED(userdata);
+    arena_t scratch = ask.scratch;
 
-    chunk = strv_sub(chunk, begin, SIZE_MAX);
-
-    arena_t scratch = ctx->scratch;
-
-    if (!str_is_empty(ctx->prev_chunk)) {
-        str_t full = str_fmt(&scratch, "%v%v", ctx->prev_chunk, chunk);
+    if (!str_is_empty(ask.prev_chunk)) {
+        str_t full = str_fmt(&scratch, "%v%v", ask.prev_chunk, chunk);
         chunk = strv(full);
-        ctx->prev_chunk = STR_EMPTY;
+        ask.prev_chunk = STR_EMPTY;
     }
-
-    // remove "data: "
-    chunk = strv_remove_prefix(chunk, 6);
     
-    json_t *json = json_parse_str(&scratch, chunk, JSON_DEFAULT);
-    if (!json) return fatal("failed to parse json: %v", chunk);
-    json_t *choices = json_get(json, strv("choices"));
-    if (!choices) return fatal("failed to get choices: %v", chunk);
-    json_t *item = choices->array;
-    if (!item) return fatal("failed to get item: %v", chunk);
+    instream_t in = istr_init(chunk);
 
-    json_t *delta = json_get(item, strv("delta"));
-    if (!delta) return fatal("failed to get delta: %v", chunk);
-    json_t *content = json_get(delta, strv("content"));
-    if (!content) return fatal("failed to get content: %v", chunk);
+    while (!istr_is_finished(&in)) {
+        strview_t line = istr_get_line(&in);
 
-    md_print_chunk(content->string, ctx);
+        if (!strv_starts_with_view(line, strv("data: "))) {
+            continue;
+        }
+
+        // incomplete chunk
+        if (istr_is_finished(&in)) {
+            if (!str_is_empty(ask.prev_chunk)) {
+                err("chunk should be empty");
+            }
+            ask.prev_chunk = str(&ask.scratch, line);
+            return;
+        }
+
+        // remove "data: "
+        line = strv_remove_prefix(line, 6);
+
+        if (strv_equals(line, strv("[DONE]"))) {
+            break;
+        }
+
+        json_t *json = json_parse_str(&scratch, line, JSON_DEFAULT);
+        if (!json) fatal("1 failed to parse json: %v", line);
+        json_t *choices = json_get(json, strv("choices"));
+        if (!choices) fatal("2 failed to get choices: %v", line);
+        json_t *item = choices->array;
+        if (!item)  fatal("3 failed to get item: %v", line);
+
+        json_t *delta = json_get(item, strv("delta"));
+        if (!delta) fatal("4 failed to get delta: %v", line);
+        json_t *content = json_get(delta, strv("content"));
+        if (!content) fatal("5 failed to get content: %v", line);
+
+        if (strv_is_empty(content->string)) {
+            continue;
+        }
+
+        os_mutex_lock(ask.mtx);
+            ostr_puts(&ask.data, content->string);
+        os_mutex_unlock(ask.mtx);
+
+    }
 }
 
 int request_thread(u64 id, void *udata) {
@@ -487,13 +565,20 @@ int request_thread(u64 id, void *udata) {
         .body = strv(body), 
     };
 
-    md_t md = {
-        .scratch = arena_scratch(&arena, MB(5)),
-        .debug_fp = os_file_open(strv("debug/output.md"), FILEMODE_WRITE),
-        .count = 1,
-    };
+#define TEST 1
+#if TEST
+    str_t content = os_file_read_all_str(&arena, strv("debug/output.md"));
 
-    http_res_t res = http_request_cb(&req, md_eval_chunk, &md);
+    for (usize i = 0; i < content.len; i += 4) {
+        strview_t chunk = str_sub(content, i, i + 4);
+        os_mutex_lock(ask.mtx);
+            ostr_puts(&ask.data, chunk);
+        os_mutex_unlock(ask.mtx);
+        Sleep(200);
+    }
+
+#else
+    http_res_t res = http_request_cb(&req, ask_grab_chunk, NULL);
 
     if (res.status_code != 200) {
         err("request failed:");
@@ -502,22 +587,70 @@ int request_thread(u64 id, void *udata) {
     }
     
     os_file_write_all_str(strv("debug/output.json"), strv(http_res_to_str(&arena, &res)));
+#endif
+
+    ATOMIC_SET(app.finished, true);
 
     return 0;
 }
 
-void test(arena_t arena) {
-    str_t data = os_file_read_all_str(&arena, strv("debug/output.md"));
-    md_t md = {
-        .scratch = arena_scratch(&arena, MB(5)),
-        .count = 1,
-    };
+bool app_update(arena_t *arena, float dt, void *udata) {
+    COLLA_UNUSED(arena); COLLA_UNUSED(udata);
+    spinner_update(&app.spinner, dt);
+    return app.finished_printing;
+}
 
-    md_print_chunk(strv(data), &md);
+void app_event(termevent_t *e, void *udata) {
+    COLLA_UNUSED(udata);
+    if (e->type == TERM_EVENT_KEY &&
+        strv_equals(strv(e->value), strv("q"))
+       ) {
+        app.finished_printing = true;
+    }
+}
 
-    os_log_set_colour_bg(LOG_COL_WHITE, LOG_COL_BLACK);
+str_t app_view(arena_t *arena, void *udata) {
+    COLLA_UNUSED(udata);
+    outstream_t out = ostr_init(arena);
 
-    os_abort(0);
+#if 0
+    if (os_mutex_try_lock(ask.mtx)) {
+        app.prev_parsed = app.parsed;
+        os_mutex_unlock(app.mtx);
+        if (ATOMIC_CHECK(app.finished)) {
+            app.finished_printing = true;
+        }
+    }
+
+    ostr_puts(&out, app.prev_parsed);
+
+    if (!ATOMIC_CHECK(app.finished)) {
+        strview_t nl = strv("\n");
+        if (strv_is_empty(app.prev_parsed)) {
+            nl = strv("");
+        }
+
+        ostr_print(&out, "%v<magenta>%v</> getting response", nl, app.spinner.frames[app.spinner.cur]);
+    }
+#endif
+
+    if (os_mutex_try_lock(ask.mtx)) {
+        strview_t chunk = ostr_as_view(&ask.data);
+        os_mutex_unlock(ask.mtx);
+
+        if (!strv_equals(chunk, app.prev_parsed)) {
+            app.prev_parsed = chunk;
+            arena_rewind(&app.md_arena, 0);
+            app.parsed = md_parse_chunk(&app.md_arena, chunk);
+        }
+    }
+
+    //arena_t scratch = *app.arena;
+
+    //str_t parsed = md_parse_chunk(&scratch, app.prev_parsed);
+    ostr_puts(&out, strv(app.parsed));
+
+    return ostr_to_str(&out);
 }
 
 int main(int argc, char **argv) {
@@ -527,9 +660,39 @@ int main(int argc, char **argv) {
 
     load_options(&arena, argc, argv);
 
-    test(arena);
+    print("hello\nworld\nhello\nworld\n");
+    print("hello\nworld\nhello\nworld\n");
+    print("hello\nworld\nhello\nworld\n");
+    print("hello\nworld\nhello\nworld\n");
+    print("hello\nworld\nhello\nworld\n");
+    print("hello\nworld\nhello\nworld\n");
+    print("hello\nworld\nhello\nworld\n");
+    print("hello\nworld\nhello\nworld\n");
 
-    request_thread(0, NULL);
+    app.md_arena = arena_make(ARENA_VIRTUAL, GB(1));
+    app.spinner = spinner_init(SPINNER_DOT);
+    app.mtx = os_mutex_create();
+    app.arena = &arena;
+    app.markdown = ostr_init(app.arena);
+
+    ask.scratch = arena_make(ARENA_VIRTUAL, GB(1));
+    ask.arena = arena_make(ARENA_VIRTUAL, GB(1));
+    ask.data = ostr_init(&ask.arena);
+    ask.mtx = os_mutex_create();
+
+    oshandle_t req_thread = os_thread_launch(request_thread, NULL);
+    os_thread_detach(req_thread);
+
+    term_init(&(termdesc_t){
+        .app = {
+            .event = app_event,
+            .update = app_update,
+            .view = app_view,
+        },
+        // .fullscreen = true,
+    });
+
+    term_run();
     
     os_log_set_colour_bg(LOG_COL_WHITE, LOG_COL_BLACK);
 }

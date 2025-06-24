@@ -1,3 +1,6 @@
 build/
 debug/
 build-all.bat
+.opencode/
+opencode.*
+*.pdb

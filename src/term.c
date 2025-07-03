@@ -181,7 +181,7 @@ void term_write(strview_t str) {
 
     int line_count = 0;
     while (!istr_is_finished(&in)) {
-        strview_t line = istr_get_line(&in);
+        strview_t line = strv_trim_right(istr_get_line(&in));
         if (line_count >= arrlen(term.last_render_lines)) {
             fatal("TODO: too many lines");
         }
@@ -190,7 +190,7 @@ void term_write(strview_t str) {
         bool has_newline = istr_prev(&in) == '\n';
         bool is_same = strv_equals(line, prev);
 
-        term_pos_t pos_before = term__get_cursor_pos();
+        // term_pos_t pos_before = term__get_cursor_pos();
 
         if (!is_same) {
             print("\r");
@@ -198,15 +198,15 @@ void term_write(strview_t str) {
             TERM_ERASE_REST_OF_LINE();
         }
 
-        term_pos_t pos_after = term__get_cursor_pos();
+        // term_pos_t pos_after = term__get_cursor_pos();
 
-        pretty_print(term.arena, "(%d:%d)|(%d:%d)", pos_before.x, pos_before.y, pos_after.x, pos_after.y);
-        if (pos_before.y != pos_after.y) {
-            line_count += pos_after.y - pos_before.y;
-        }
+        // pretty_print(term.arena, "(%d:%d)|(%d:%d)", pos_before.x, pos_before.y, pos_after.x, pos_after.y);
+        // if (pos_before.y != pos_after.y) {
+        //     line_count += pos_after.y - pos_before.y;
+        // }
 
         if (has_newline) {
-            if (is_same) {
+            if (is_same || term.fullscreen) {
                 TERM_MOV_DOWN(1);
             }
             else {
@@ -472,6 +472,20 @@ void term_vt_process(term_vt_parser_t *ctx, char c) {
             else if (c == '\x0d') {
                 term_send_key_event(strv("enter"), mod[ctx->modifier]);
             }
+            // ctrl + ?
+            else if (c <= '\x1f' && c & '\x1f') {
+                strview_t modifier = mod[ctx->modifier];
+                if (strv_is_empty(modifier)) {
+                    modifier = strv("ctrl");
+                }
+                else {
+                    arena_t* arena = &term.frame_arenas[term.cur_arena];
+                    str_t tmp = str_fmt(arena, "%v+ctrl", modifier);
+                    modifier = strv(tmp);
+                }
+                c = char_lower(c | 0x40);
+                term_send_key_event(strv(&c, 1), modifier);
+            }
             else {
                 term_send_key_event(strv(&c, 1), mod[ctx->modifier]);
             }
@@ -538,7 +552,7 @@ void term__poll_input(void) {
         return;
     }
 
-    u8 buffer[16];
+    u8 buffer[64];
     usize read = os_file_read(conin, buffer, sizeof(buffer)); 
     if (read == 0) {
         term.should_quit = true;
@@ -589,7 +603,13 @@ term_pos_t term__get_cursor_pos(void) {
     instream_t in = istr_init(strv((char*)buffer, read));
 
     if (istr_get(&in) != '\x1b') {
-        fatal("first char is not ESC: 0x%02x", istr_prev(&in));
+        err("first char is not ESC: 0x%02x", istr_prev(&in));
+        istr_rewind(&in);
+        while (!istr_is_finished(&in)) {
+            print("[0x%02x:%c] ", istr_get(&in), istr_prev(&in));
+        }
+        print("\n");
+        os_abort(0);
     }
 
     if (istr_get(&in) != '[') {
